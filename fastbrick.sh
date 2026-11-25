@@ -10,20 +10,122 @@ if [ ! -f "$SCRIPT_DIR/profile.sh" ]; then
     exit 1
 fi
 
+# The paths below (bin/..., the payload) are relative to the package, so run
+# from there no matter where the script was launched from.
+cd "$SCRIPT_DIR"
+
 . "$SCRIPT_DIR/profile.sh"
 
-if [ `uname -m | grep 64` ]; then
-    FASTBOOT=bin/fastboot
+HOST_OS=$(uname -s)
+SPARSE_ARGS=""
+
+if [ "$HOST_OS" = "Darwin" ]; then
+    # bin/fastboot and bin/fastboot32 are Linux ELF binaries and cannot run on
+    # macOS. Use a bundled bin/fastboot-macos if the package has one, otherwise
+    # Google's macOS fastboot from Android platform-tools.
+    if [ -f bin/fastboot-macos ]; then
+        FASTBOOT=bin/fastboot-macos
+        chmod a+x "$FASTBOOT"
+        xattr -d com.apple.quarantine "$FASTBOOT" 2>/dev/null || true
+    elif command -v fastboot >/dev/null 2>&1; then
+        FASTBOOT=$(command -v fastboot)
+    else
+        echo "Error: macOS fastboot not found."
+        echo "Install Android platform-tools, then run this script again:"
+        echo "    brew install --cask android-platform-tools"
+        exit 1
+    fi
 else
-    FASTBOOT=bin/fastboot32
+    if [ `uname -m | grep 64` ]; then
+        FASTBOOT=bin/fastboot
+    else
+        FASTBOOT=bin/fastboot32
+    fi
+
+    chmod a+x bin/fastboot{,32}
 fi
 
-chmod a+x bin/fastboot{,32}
+# Replaces `declare -A DEVICE_MAP` (needs bash 4+, macOS ships bash 3.2).
+device_name() {
+    case "$1" in
+        CRONOS)   echo "Echo Show 5 2nd Generation - 2021" ;;
+        CROWN)    echo "Echo Show 8 1st Generation - 2019" ;;
+        CHECKERS) echo "Echo Show 5 1st Generation - 2019" ;;
+        *)        echo "" ;;
+    esac
+}
 
-declare -A DEVICE_MAP
-DEVICE_MAP["CRONOS"]="Echo Show 5 2nd Generation - 2021"
-DEVICE_MAP["CROWN"]="Echo Show 8 1st Generation - 2019"
-DEVICE_MAP["CHECKERS"]="Echo Show 5 1st Generation - 2019"
+# GNU `timeout` is not part of macOS. Use timeout/gtimeout when present,
+# otherwise emulate it: send SIGTERM after N seconds and return 124 if the
+# command had to be killed, the same exit code GNU timeout uses.
+run_with_timeout() {
+    local secs=$1
+    shift
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+        return $?
+    fi
+
+    local marker
+    marker=$(mktemp "${TMPDIR:-/tmp}/amonet-timeout.XXXXXX")
+    rm -f "$marker"
+
+    "$@" &
+    local pid=$!
+
+    # Watcher output goes to /dev/null so it never holds the $(...) pipe open.
+    ( sleep "$secs"
+      if kill -0 "$pid" 2>/dev/null; then
+          touch "$marker"
+          kill -TERM "$pid" 2>/dev/null
+      fi ) >/dev/null 2>&1 &
+    local watcher=$!
+
+    local rc=0
+    wait "$pid" || rc=$?
+
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+
+    if [ -f "$marker" ]; then
+        rm -f "$marker"
+        return 124
+    fi
+    return $rc
+}
+
+# Current platform-tools fastboot refuses to send a raw image larger than the
+# device's max-download-size, and fastbrick.img can be larger than that.
+# Raise the limit with -S so it still goes in as one download. Only applied on
+# macOS; the Linux path keeps the bundled fastboot and its behavior.
+detect_sparse_args() {
+    SPARSE_ARGS=""
+    if [ "$HOST_OS" != "Darwin" ]; then
+        return 0
+    fi
+
+    local payload_bytes max_raw max_bytes
+    payload_bytes=$(wc -c < "$FULL_IMAGE" | tr -d ' ')
+
+    max_raw=$($FASTBOOT getvar max-download-size 2>&1 | grep "max-download-size:" | cut -d' ' -f2 | head -n1)
+    if [ -n "$max_raw" ]; then
+        max_bytes=$(( max_raw ))
+        echo -e "${CYAN}Payload size: $payload_bytes bytes, device max-download-size: $max_bytes bytes${RESET}"
+        if [ "$payload_bytes" -le "$max_bytes" ]; then
+            return 0
+        fi
+    else
+        echo -e "${YELLOW}Could not read max-download-size, raising the limit to be safe.${RESET}"
+    fi
+
+    SPARSE_ARGS="-S $(( (payload_bytes + 1048575) / 1048576 ))M"
+    echo -e "${CYAN}Payload is larger than the device limit, will send with: $SPARSE_ARGS${RESET}"
+}
 
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && tput colors >/dev/null 2>&1 && [ $(tput colors) -ge 8 ]; then
     RED='\033[31m'
@@ -82,7 +184,7 @@ wait_for_device() {
             continue
         fi
 
-        FRIENDLY_NAME="${DEVICE_MAP[$PRODUCT]}"
+        FRIENDLY_NAME=$(device_name "$PRODUCT")
         if [ -z "$FRIENDLY_NAME" ]; then
             FRIENDLY_NAME="Unknown device"
         fi
@@ -120,10 +222,11 @@ detect_image() {
     fi
 
     if [ -n "$LK_BUILD_DESC" ]; then
-        for build in "${!IMAGE_MAP[@]}"; do
+        for entry in "${IMAGE_MAP_ENTRIES[@]}"; do
+            build="${entry%%=*}"
             case "$LK_BUILD_DESC" in
                 "$build"*)
-                    FULL_IMAGE="${IMAGE_MAP[$build]}"
+                    FULL_IMAGE="${entry#*=}"
                     break
                     ;;
             esac
@@ -143,7 +246,7 @@ flash_payload() {
     local attempt=1
     while true; do
         set +e
-        OUTPUT=$(timeout 8 $FASTBOOT flash brick "$FULL_IMAGE" 2>&1)
+        OUTPUT=$(run_with_timeout 8 $FASTBOOT $SPARSE_ARGS flash brick "$FULL_IMAGE" 2>&1)
         EXIT_CODE=$?
         set -e
 
@@ -188,6 +291,7 @@ flash_payload() {
             return 0
         fi
 
+        echo -e "${YELLOW}Attempt $attempt did not go through (exit $EXIT_CODE): $(echo "$OUTPUT" | tail -n1)${RESET}"
         sleep 2
         attempt=$((attempt + 1))
     done
@@ -196,9 +300,13 @@ flash_payload() {
 clear
 print_banner
 
+echo -e "${CYAN}Host: $HOST_OS, fastboot: $FASTBOOT${RESET}"
+echo ""
+
 wait_for_device
 check_unlocked
 detect_image
+detect_sparse_args
 
 echo ""
 echo -n "Run amonet-fastbrick to unlock the bootloader? (Type \"YES\" to continue): "
